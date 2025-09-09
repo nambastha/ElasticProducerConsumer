@@ -1,0 +1,118 @@
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=changeme
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - elastic-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -u elastic:changeme -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=changeme
+      - xpack.security.enabled=false
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - elastic-network
+
+  elastic-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    environment:
+      - ELASTIC_HOST=elasticsearch
+      - ELASTIC_PORT=9200
+      - ELASTIC_PROTOCOL=http
+      - ELASTIC_USERNAME=elastic
+      - ELASTIC_PASSWORD=changeme
+      - PRODUCER_RECORDS_PER_DAY=300000
+      - PRODUCER_BATCH_SIZE=100
+      - PRODUCER_FLUSH_INTERVAL=5000
+      - HEALTH_PORT=8080
+      - LOG_LEVEL=INFO
+      - METRICS_ENABLED=true
+    ports:
+      - "8080:8080"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - elastic-network
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 30s
+        max_attempts: 3
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  elastic-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    environment:
+      - ELASTIC_HOST=elasticsearch
+      - ELASTIC_PORT=9200
+      - ELASTIC_PROTOCOL=http
+      - ELASTIC_USERNAME=elastic
+      - ELASTIC_PASSWORD=changeme
+      - CONSUMER_ID=elastic-consumer-1
+      - CONSUMER_SOURCE_INDEX=completion-audit-logs
+      - CONSUMER_OFFSET_INDEX=consumer-offsets
+      - CONSUMER_BATCH_SIZE=100
+      - CONSUMER_POLL_INTERVAL=1000
+      - HEALTH_PORT=8080
+      - LOG_LEVEL=INFO
+      - METRICS_ENABLED=true
+    ports:
+      - "8081:8080"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - elastic-network
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 30s
+        max_attempts: 3
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  elastic-network:
+    driver: bridge
+
+volumes:
+  elasticsearch_data:
+    driver: local

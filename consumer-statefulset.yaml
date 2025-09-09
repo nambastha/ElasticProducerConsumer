@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: consumer-statefulset
+spec:
+  serviceName: "consumer"
+  replicas: 3 # You can scale the number of consumers
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+    spec:
+      containers:
+      - name: consumer
+        image: your-docker-image:latest # Replace with your Docker image
+        args: ["consumer"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: ELASTICSEARCH_HOST
+          value: "elasticsearch-service" # Replace with your Elasticsearch service name
+        - name: ELASTICSEARCH_PORT
+          value: "9200"

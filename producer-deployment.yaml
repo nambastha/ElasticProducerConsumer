@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      containers:
+      - name: producer
+        image: your-docker-image:latest # Replace with your Docker image
+        args: ["producer"]
+        env:
+        - name: ELASTICSEARCH_HOST
+          value: "elasticsearch-service" # Replace with your Elasticsearch service name
+        - name: ELASTICSEARCH_PORT
+          value: "9200"

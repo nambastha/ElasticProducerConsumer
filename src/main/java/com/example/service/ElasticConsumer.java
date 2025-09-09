@@ -1,0 +1,289 @@
+package com.example.service;
+
+import co.elastic.clients.elasticsearch._types.SortOrder;
+import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import co.elastic.clients.elasticsearch._types.query_dsl.RangeQuery;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.search.Hit;
+import co.elastic.clients.json.JsonData;
+import com.example.config.ElasticConfig;
+import com.example.metrics.MetricsCollector;
+import com.example.model.AuditLog;
+import com.example.model.ConsumerOffset;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class ElasticConsumer {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ElasticConsumer.class);
+    private static final DateTimeFormatter ES_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    
+    private final ElasticsearchService elasticsearchService;
+    private final ElasticConfig config;
+    private final MetricsCollector metricsCollector;
+    private final ScheduledExecutorService scheduler;
+    
+    private volatile boolean running = false;
+    private volatile ConsumerOffset currentOffset;
+    private final AtomicLong recordsProcessed = new AtomicLong(0);
+    private final Set<String> processedQueryIds = new HashSet<>();
+    
+    public ElasticConsumer(ElasticsearchService elasticsearchService, ElasticConfig config, 
+                          MetricsCollector metricsCollector) {
+        this.elasticsearchService = elasticsearchService;
+        this.config = config;
+        this.metricsCollector = metricsCollector;
+        this.scheduler = Executors.newScheduledThreadPool(2);
+        
+        initializeOffset();
+    }
+    
+    private void initializeOffset() {
+        try {
+            currentOffset = elasticsearchService.getConsumerOffset(
+                config.getConsumerId(), 
+                config.getConsumerSourceIndex()
+            );
+            
+            logger.info("Consumer offset initialized: {}", currentOffset);
+            
+        } catch (Exception e) {
+            logger.error("Failed to initialize consumer offset", e);
+            throw new RuntimeException("Failed to initialize consumer offset", e);
+        }
+    }
+    
+    public void start() {
+        if (running) {
+            logger.warn("Consumer is already running");
+            return;
+        }
+        
+        running = true;
+        logger.info("Starting Elasticsearch consumer...");
+        
+        int pollInterval = config.getConsumerPollInterval();
+        
+        scheduler.scheduleAtFixedRate(this::pollAndProcess, 0, pollInterval, TimeUnit.MILLISECONDS);
+        
+        scheduler.scheduleAtFixedRate(this::saveOffset, 30000, 30000, TimeUnit.MILLISECONDS);
+        
+        logger.info("Consumer started with poll interval: {} ms", pollInterval);
+    }
+    
+    public void stop() {
+        if (!running) {
+            logger.warn("Consumer is not running");
+            return;
+        }
+        
+        logger.info("Stopping Elasticsearch consumer...");
+        running = false;
+        
+        saveOffset();
+        
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(30, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            scheduler.shutdownNow();
+        }
+        
+        logger.info("Consumer stopped. Total records processed: {}", recordsProcessed.get());
+    }
+    
+    private void pollAndProcess() {
+        if (!running) return;
+        
+        try {
+            long startTime = System.currentTimeMillis();
+            
+            SearchRequest searchRequest = buildSearchRequest();
+            SearchResponse<AuditLog> response = elasticsearchService.searchAuditLogs(searchRequest);
+            
+            List<Hit<AuditLog>> hits = response.hits().hits();
+            
+            if (hits.isEmpty()) {
+                logger.debug("No new records found");
+                return;
+            }
+            
+            logger.debug("Found {} records to process", hits.size());
+            
+            int processedCount = 0;
+            int duplicatesSkipped = 0;
+            LocalDateTime latestTimestamp = currentOffset.getLastProcessedTimestamp();
+            String latestDocId = currentOffset.getLastProcessedDocId();
+            
+            for (Hit<AuditLog> hit : hits) {
+                String docId = hit.id();
+                AuditLog auditLog = hit.source();
+                
+                if (auditLog == null) {
+                    logger.warn("Null audit log found for document: {}", docId);
+                    continue;
+                }
+                
+                if (!isValidCompletionAuditDoc(docId)) {
+                    logger.debug("Skipping non-COMPLETION_AUDIT document: {}", docId);
+                    continue;
+                }
+                
+                if (isDuplicate(auditLog.getQueryId())) {
+                    logger.debug("Skipping duplicate query_id: {} for document: {}", auditLog.getQueryId(), docId);
+                    duplicatesSkipped++;
+                    metricsCollector.incrementDuplicatesSkipped();
+                    continue;
+                }
+                
+                boolean processed = processRecord(docId, auditLog);
+                
+                if (processed) {
+                    processedCount++;
+                    processedQueryIds.add(auditLog.getQueryId());
+                    
+                    LocalDateTime recordTimestamp = auditLog.getStartTime();
+                    if (recordTimestamp != null && recordTimestamp.isAfter(latestTimestamp)) {
+                        latestTimestamp = recordTimestamp;
+                        latestDocId = docId;
+                    }
+                }
+            }
+            
+            if (processedCount > 0) {
+                updateOffset(latestTimestamp, latestDocId, processedCount);
+            }
+            
+            long duration = System.currentTimeMillis() - startTime;
+            metricsCollector.recordConsumerProcessingTime(duration);
+            
+            logger.debug("Processing cycle completed - Processed: {}, Duplicates skipped: {}, Duration: {} ms", 
+                       processedCount, duplicatesSkipped, duration);
+                       
+        } catch (Exception e) {
+            logger.error("Error during poll and process cycle", e);
+            metricsCollector.incrementErrors();
+        }
+    }
+    
+    private SearchRequest buildSearchRequest() {
+        LocalDateTime fromTime = currentOffset.getLastProcessedTimestamp();
+        String lastDocId = currentOffset.getLastProcessedDocId();
+        
+        BoolQuery.Builder boolQueryBuilder = new BoolQuery.Builder()
+            .must(Query.of(q -> q.range(RangeQuery.of(r -> r
+                .field("start_time")
+                .gte(JsonData.of(fromTime.format(ES_DATE_FORMAT)))
+            ))));
+        
+        if (lastDocId != null) {
+            boolQueryBuilder.mustNot(Query.of(q -> q.term(t -> t
+                .field("_id")
+                .value(lastDocId)
+            )));
+        }
+        
+        return SearchRequest.of(s -> s
+            .index(config.getConsumerSourceIndex())
+            .query(Query.of(q -> q.bool(boolQueryBuilder.build())))
+            .sort(sort -> sort
+                .field(f -> f
+                    .field("start_time")
+                    .order(SortOrder.Asc)
+                )
+            )
+            .size(config.getConsumerBatchSize())
+        );
+    }
+    
+    private boolean isValidCompletionAuditDoc(String docId) {
+        return docId != null && docId.startsWith("COMPLETION_AUDIT_");
+    }
+    
+    private boolean isDuplicate(String queryId) {
+        return processedQueryIds.contains(queryId);
+    }
+    
+    private boolean processRecord(String docId, AuditLog auditLog) {
+        try {
+            logger.debug("Processing record - ID: {}, QueryID: {}, User: {}, Action: {}, Query: {}", 
+                       docId, auditLog.getQueryId(), auditLog.getUsername(), auditLog.getAction(), 
+                       auditLog.getQuery());
+            
+            recordsProcessed.incrementAndGet();
+            metricsCollector.incrementRecordsProcessed();
+            
+            return true;
+            
+        } catch (Exception e) {
+            logger.error("Failed to process record: {}", docId, e);
+            metricsCollector.incrementErrors();
+            return false;
+        }
+    }
+    
+    private void updateOffset(LocalDateTime latestTimestamp, String latestDocId, int processedCount) {
+        try {
+            currentOffset.setLastProcessedTimestamp(latestTimestamp);
+            currentOffset.setLastProcessedDocId(latestDocId);
+            currentOffset.setLastUpdated(LocalDateTime.now());
+            currentOffset.setTotalProcessed(currentOffset.getTotalProcessed() + processedCount);
+            
+            logger.debug("Updated offset - Latest timestamp: {}, Latest doc: {}, Total processed: {}", 
+                       latestTimestamp, latestDocId, currentOffset.getTotalProcessed());
+                       
+        } catch (Exception e) {
+            logger.error("Failed to update offset", e);
+            metricsCollector.incrementErrors();
+        }
+    }
+    
+    private void saveOffset() {
+        if (currentOffset != null) {
+            try {
+                elasticsearchService.saveConsumerOffset(currentOffset).get(10, TimeUnit.SECONDS);
+                logger.debug("Consumer offset saved successfully");
+                
+                if (processedQueryIds.size() > 10000) {
+                    processedQueryIds.clear();
+                    logger.debug("Cleared processed query IDs cache");
+                }
+                
+            } catch (Exception e) {
+                logger.error("Failed to save consumer offset", e);
+                metricsCollector.incrementErrors();
+            }
+        }
+    }
+    
+    public long getRecordsProcessed() {
+        return recordsProcessed.get();
+    }
+    
+    public boolean isRunning() {
+        return running;
+    }
+    
+    public ConsumerOffset getCurrentOffset() {
+        return currentOffset;
+    }
+    
+    public long getTotalProcessedFromOffset() {
+        return currentOffset != null ? currentOffset.getTotalProcessed() : 0;
+    }
+}

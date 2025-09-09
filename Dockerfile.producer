@@ -1,0 +1,29 @@
+FROM openjdk:17-jdk-slim
+
+LABEL maintainer="elastic-producer-consumer"
+LABEL version="1.0"
+LABEL description="Elasticsearch Producer Application"
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/logs
+
+WORKDIR /app
+
+COPY target/elastic-producer.jar /app/elastic-producer.jar
+
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -u 1001 appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8080
+
+ENV JAVA_OPTS="-Xms512m -Xmx1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -Xloggc:/app/logs/gc.log"
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["sh", "-c", "java $JAVA_OPTS -jar /app/elastic-producer.jar"]

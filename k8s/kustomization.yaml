@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: default
+
+commonLabels:
+  app.kubernetes.io/name: elastic-producer-consumer
+  app.kubernetes.io/version: "1.0"
+  app.kubernetes.io/component: data-processing
+  app.kubernetes.io/part-of: elasticsearch-pipeline
+
+resources:
+  - rbac.yaml
+  - secret.yaml
+  - configmap.yaml
+  - producer-deployment.yaml
+  - consumer-deployment.yaml
+  - services.yaml
+
+images:
+  - name: elastic-producer
+    newTag: latest
+  - name: elastic-consumer
+    newTag: latest
+
+replicas:
+  - name: elastic-producer
+    count: 1
+  - name: elastic-consumer
+    count: 2
+
+configMapGenerator:
+  - name: elastic-producer-consumer-config
+    files:
+      - application.conf
+      - logback.xml

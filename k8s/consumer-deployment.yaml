@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elastic-consumer
+  namespace: default
+  labels:
+    app: elastic-consumer
+    component: consumer
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: elastic-consumer
+      component: consumer
+  template:
+    metadata:
+      labels:
+        app: elastic-consumer
+        component: consumer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: elastic-producer-consumer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+      - name: elastic-consumer
+        image: elastic-consumer:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: health
+          protocol: TCP
+        env:
+        - name: ELASTIC_HOST
+          value: "elasticsearch-service"
+        - name: ELASTIC_PORT
+          value: "9200"
+        - name: ELASTIC_PROTOCOL
+          value: "http"
+        - name: ELASTIC_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: ELASTIC_USERNAME
+        - name: ELASTIC_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: elastic-credentials
+              key: ELASTIC_PASSWORD
+        - name: CONSUMER_ID
+          value: "elastic-consumer-$(POD_NAME)"
+        - name: CONSUMER_SOURCE_INDEX
+          value: "completion-audit-logs"
+        - name: CONSUMER_OFFSET_INDEX
+          value: "consumer-offsets"
+        - name: CONSUMER_BATCH_SIZE
+          value: "100"
+        - name: CONSUMER_POLL_INTERVAL
+          value: "1000"
+        - name: CONSUMER_SCROLL_TIMEOUT
+          value: "1m"
+        - name: HEALTH_PORT
+          value: "8080"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: METRICS_ENABLED
+          value: "true"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: JAVA_OPTS
+          value: "-Xms512m -Xmx1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health/liveness
+            port: health
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/readiness
+            port: health
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health/liveness
+            port: health
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 12
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: config
+        configMap:
+          name: elastic-producer-consumer-config
+      - name: logs
+        emptyDir: {}
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

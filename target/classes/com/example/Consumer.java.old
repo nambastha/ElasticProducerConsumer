@@ -1,0 +1,89 @@
+package com.example;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.elasticsearch.action.get.GetRequest;
+import org.elasticsearch.action.get.GetResponse;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.search.SearchRequest;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.client.RequestOptions;
+import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.sort.SortOrder;
+
+import java.io.IOException;
+import java.util.Map;
+
+public class Consumer {
+    private final RestHighLevelClient client;
+    private final String indexName;
+    private final String offsetIndexName;
+    private final String consumerId;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public Consumer(RestHighLevelClient client, String indexName, String offsetIndexName) {
+        this.client = client;
+        this.indexName = indexName;
+        this.offsetIndexName = offsetIndexName;
+        this.consumerId = System.getenv("POD_NAME"); // Get the pod name from environment variable
+    }
+
+    public void start() {
+        while (true) {
+            try {
+                Object[] searchAfter = getLastOffset();
+
+                SearchRequest searchRequest = new SearchRequest(indexName);
+                SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+                searchSourceBuilder.query(QueryBuilders.prefixQuery("_id", "COMPLETION_AUDIT_"));
+                searchSourceBuilder.sort("start_time", SortOrder.ASC);
+                searchSourceBuilder.sort("_id", SortOrder.ASC);
+                searchSourceBuilder.size(100);
+                if (searchAfter != null) {
+                    searchSourceBuilder.searchAfter(searchAfter);
+                }
+                searchRequest.source(searchSourceBuilder);
+
+                SearchResponse searchResponse = client.search(searchRequest, RequestOptions.DEFAULT);
+                SearchHit[] hits = searchResponse.getHits().getHits();
+
+                if (hits.length > 0) {
+                    for (SearchHit hit : hits) {
+                        LogMessage logMessage = objectMapper.readValue(hit.getSourceAsString(), LogMessage.class);
+                        System.out.println("Consumed message with id: " + hit.getId());
+                        // Process the log message here
+                    }
+
+                    Object[] lastSortValues = hits[hits.length - 1].getSortValues();
+                    saveOffset(lastSortValues);
+                } else {
+                    // No new documents, wait for a while
+                    Thread.sleep(5000);
+                }
+            } catch (IOException | InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private Object[] getLastOffset() throws IOException {
+        GetRequest getRequest = new GetRequest(offsetIndexName, consumerId);
+        GetResponse getResponse = client.get(getRequest, RequestOptions.DEFAULT);
+        if (getResponse.isExists()) {
+            Map<String, Object> source = getResponse.getSourceAsMap();
+            return ((java.util.List<Object>) source.get("search_after")).toArray();
+        } else {
+            return null;
+        }
+    }
+
+    private void saveOffset(Object[] searchAfter) throws IOException {
+        IndexRequest indexRequest = new IndexRequest(offsetIndexName)
+                .id(consumerId)
+                .source(Map.of("search_after", searchAfter), XContentType.JSON);
+        client.index(indexRequest, RequestOptions.DEFAULT);
+    }
+}
