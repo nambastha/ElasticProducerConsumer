@@ -15,7 +15,9 @@ import com.example.model.ConsumerOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.HashSet;
 import java.util.List;
@@ -29,6 +31,7 @@ public class ElasticConsumer {
     
     private static final Logger logger = LoggerFactory.getLogger(ElasticConsumer.class);
     private static final DateTimeFormatter ES_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final DateTimeFormatter ISO_INSTANT_FORMAT = DateTimeFormatter.ISO_INSTANT;
     
     private final ElasticsearchService elasticsearchService;
     private final ElasticConfig config;
@@ -138,6 +141,27 @@ public class ElasticConsumer {
         logger.info("Consumer loop stopped");
     }
     
+    /**
+     * Converts ISO instant format (1970-01-01T00:00:00Z) to Elasticsearch format (1970-01-01 00:00:00.000)
+     * @param isoInstantString ISO instant format string
+     * @return Elasticsearch compatible datetime string
+     */
+    private String convertIsoInstantToEsFormat(String isoInstantString) {
+        if (isoInstantString == null || isoInstantString.isEmpty()) {
+            return null;
+        }
+        
+        try {
+            // Parse the ISO instant format and convert to UTC LocalDateTime
+            Instant instant = Instant.parse(isoInstantString);
+            LocalDateTime utcDateTime = instant.atZone(ZoneOffset.UTC).toLocalDateTime();
+            return utcDateTime.format(ES_DATE_FORMAT);
+        } catch (Exception e) {
+            logger.error("Failed to convert ISO instant '{}' to ES format", isoInstantString, e);
+            return isoInstantString; // Return original if conversion fails
+        }
+    }
+    
     private int pollAndProcess() {
         if (!running) return 0;
         
@@ -145,7 +169,21 @@ public class ElasticConsumer {
             long startTime = System.currentTimeMillis();
             
             SearchRequest searchRequest = buildSearchRequest();
-            SearchResponse<AuditLog> response = elasticsearchService.searchAuditLogs(searchRequest);
+            SearchResponse<AuditLog> response = null;
+            
+            try {
+                response = elasticsearchService.searchAuditLogs(searchRequest);
+            } catch (Exception e) {
+                if (e.getMessage() != null && e.getMessage().contains("no such index")) {
+                    logger.warn("Source index '{}' does not exist yet, waiting for data", config.getConsumerSourceIndex());
+                    return 0;
+                } else if (e.getMessage() != null && e.getMessage().contains("all shards failed")) {
+                    logger.warn("All shards failed for index '{}', possibly empty or initializing", config.getConsumerSourceIndex());
+                    return 0;
+                } else {
+                    throw e; // Re-throw other exceptions
+                }
+            }
             
             List<Hit<AuditLog>> hits = response.hits().hits();
             
@@ -219,30 +257,43 @@ public class ElasticConsumer {
         LocalDateTime fromTime = currentOffset.getLastProcessedTimestamp();
         String lastDocId = currentOffset.getLastProcessedDocId();
         
-        BoolQuery.Builder boolQueryBuilder = new BoolQuery.Builder()
-            .must(Query.of(q -> q.range(RangeQuery.of(r -> r
-                .field("start_time")
-                .gte(JsonData.of(fromTime.format(ES_DATE_FORMAT)))
-            ))));
+        logger.debug("Building search request - fromTime: {}, lastDocId: {}", fromTime, lastDocId);
         
-        if (lastDocId != null) {
-            boolQueryBuilder.mustNot(Query.of(q -> q.term(t -> t
-                .field("_id")
-                .value(lastDocId)
-            )));
-        }
-        
-        return SearchRequest.of(s -> s
-            .index(config.getConsumerSourceIndex())
-            .query(Query.of(q -> q.bool(boolQueryBuilder.build())))
-            .sort(sort -> sort
-                .field(f -> f
+        try {
+            BoolQuery.Builder boolQueryBuilder = new BoolQuery.Builder()
+                .must(Query.of(q -> q.range(RangeQuery.of(r -> r
                     .field("start_time")
-                    .order(SortOrder.Asc)
+                    .gte(JsonData.of(fromTime.format(ES_DATE_FORMAT)))
+                ))));
+            
+            if (lastDocId != null && !lastDocId.trim().isEmpty()) {
+                boolQueryBuilder.mustNot(Query.of(q -> q.term(t -> t
+                    .field("_id")
+                    .value(lastDocId)
+                )));
+            }
+            
+            SearchRequest searchRequest = SearchRequest.of(s -> s
+                .index(config.getConsumerSourceIndex())
+                .query(Query.of(q -> q.bool(boolQueryBuilder.build())))
+                .sort(sort -> sort
+                    .field(f -> f
+                        .field("start_time")
+                        .order(SortOrder.Asc)
+                    )
                 )
-            )
-            .size(config.getConsumerBatchSize())
-        );
+                .size(config.getConsumerBatchSize())
+                .ignoreUnavailable(true)  // Ignore if index doesn't exist
+                .allowNoIndices(true)     // Allow empty result if no indices
+            );
+            
+            logger.debug("Search request built successfully for index: {}", config.getConsumerSourceIndex());
+            return searchRequest;
+            
+        } catch (Exception e) {
+            logger.error("Failed to build search request", e);
+            throw new RuntimeException("Failed to build search request", e);
+        }
     }
     
     private boolean isValidCompletionAuditDoc(String docId) {
