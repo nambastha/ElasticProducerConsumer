@@ -74,13 +74,13 @@ public class ElasticConsumer {
         running = true;
         logger.info("Starting Elasticsearch consumer...");
         
-        int pollInterval = config.getConsumerPollInterval();
+        // Start the main consumer loop in a separate thread
+        scheduler.execute(this::consumerLoop);
         
-        scheduler.scheduleAtFixedRate(this::pollAndProcess, 0, pollInterval, TimeUnit.MILLISECONDS);
-        
+        // Schedule periodic offset saves
         scheduler.scheduleAtFixedRate(this::saveOffset, 30000, 30000, TimeUnit.MILLISECONDS);
         
-        logger.info("Consumer started with poll interval: {} ms", pollInterval);
+        logger.info("Consumer started with Kafka-style continuous polling");
     }
     
     public void stop() {
@@ -107,8 +107,39 @@ public class ElasticConsumer {
         logger.info("Consumer stopped. Total records processed: {}", recordsProcessed.get());
     }
     
-    private void pollAndProcess() {
-        if (!running) return;
+    private void consumerLoop() {
+        logger.info("Consumer loop started");
+        int pollInterval = config.getConsumerPollInterval();
+        
+        while (running) {
+            try {
+                int processedInCycle = pollAndProcess();
+                
+                // Sleep only if no records were processed (like Kafka)
+                if (processedInCycle == 0) {
+                    Thread.sleep(pollInterval);
+                }
+                
+            } catch (InterruptedException e) {
+                logger.info("Consumer loop interrupted");
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                logger.error("Unexpected error in consumer loop", e);
+                try {
+                    Thread.sleep(pollInterval);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        
+        logger.info("Consumer loop stopped");
+    }
+    
+    private int pollAndProcess() {
+        if (!running) return 0;
         
         try {
             long startTime = System.currentTimeMillis();
@@ -120,7 +151,7 @@ public class ElasticConsumer {
             
             if (hits.isEmpty()) {
                 logger.debug("No new records found");
-                return;
+                return 0;
             }
             
             logger.debug("Found {} records to process", hits.size());
@@ -174,10 +205,13 @@ public class ElasticConsumer {
             
             logger.debug("Processing cycle completed - Processed: {}, Duplicates skipped: {}, Duration: {} ms", 
                        processedCount, duplicatesSkipped, duration);
+            
+            return processedCount;
                        
         } catch (Exception e) {
             logger.error("Error during poll and process cycle", e);
             metricsCollector.incrementErrors();
+            return 0;
         }
     }
     
