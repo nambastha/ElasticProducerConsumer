@@ -21,6 +21,7 @@ public class MetricsCollector {
     private final Gauge currentBatchSize;
     private final Timer consumerProcessingTime;
     private final Counter duplicatesSkipped;
+    private final Counter batchesProcessed;
     
     private final AtomicLong currentBatchSizeValue = new AtomicLong(0);
     private final AtomicReference<Double> lastProcessingTimeSeconds = new AtomicReference<>(0.0);
@@ -54,6 +55,10 @@ public class MetricsCollector {
             
         this.duplicatesSkipped = Counter.builder("elastic.consumer.duplicates.skipped")
             .description("Total number of duplicate records skipped")
+            .register(meterRegistry);
+            
+        this.batchesProcessed = Counter.builder("elastic.consumer.batches.processed")
+            .description("Total number of batches processed and uploaded")
             .register(meterRegistry);
     }
     
@@ -92,6 +97,10 @@ public class MetricsCollector {
     
     public void updateCurrentBatchSize(long size) {
         currentBatchSizeValue.set(size);
+    }
+    
+    public void incrementBatchesProcessed() {
+        batchesProcessed.increment();
     }
     
     private double getCurrentBatchSizeValue() {

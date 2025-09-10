@@ -117,13 +117,8 @@ public class ElasticProducer {
         try {
             AuditLog auditLog = createRandomAuditLog();
             
-            // Generate both AUDIT_ and COMPLETION_AUDIT_ document types (60% COMPLETION_AUDIT_, 40% AUDIT_)
-            Random random = new Random();
-            LocalDateTime now = LocalDateTime.now();
-            String timestamp = now.format(ELASTIC_TIMESTAMP_FORMATTER);
-            String documentId = (random.nextDouble() < 0.6) 
-                ? "COMPLETION_AUDIT_" + timestamp
-                : "AUDIT_" + timestamp;
+            // Generate COMPLETION_AUDIT_ document IDs with timestamp format: COMPLETION_AUDIT_yyyyMMddHHmmssSSS
+            String documentId = generateCompletionAuditId();
             
             synchronized (batchLock) {
                 batchBuffer.add(auditLog);
@@ -190,6 +185,26 @@ public class ElasticProducer {
                 .map(i -> 'a' + new Random().nextInt(26))
                 .collect(StringBuilder::new, (sb, c) -> sb.append((char) c), StringBuilder::append)
                 .toString();
+    }
+    
+    /**
+     * Generate document ID in format: COMPLETION_AUDIT_yyyyMMddHHmmssSSS
+     * Example: COMPLETION_AUDIT_20241210123045123
+     */
+    public static String generateCompletionAuditId() {
+        LocalDateTime now = LocalDateTime.now();
+        String timestamp = now.format(ELASTIC_TIMESTAMP_FORMATTER);
+        return "COMPLETION_AUDIT_" + timestamp;
+    }
+    
+    /**
+     * Generate document ID with custom timestamp
+     * @param dateTime Custom timestamp
+     * @return Document ID in format: COMPLETION_AUDIT_yyyyMMddHHmmssSSS
+     */
+    public static String generateCompletionAuditId(LocalDateTime dateTime) {
+        String timestamp = dateTime.format(ELASTIC_TIMESTAMP_FORMATTER);
+        return "COMPLETION_AUDIT_" + timestamp;
     }
     
     private void flushBatch() {
